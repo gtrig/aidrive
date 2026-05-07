@@ -103,7 +103,7 @@ class LineTools():
         l1 = LineString([(line1[0][1],line1[0][0]), (line1[1][1],line1[1][0])])
         l2 = LineString([(line2[0][1],line2[0][0]), (line2[1][1],line2[1][0])])
         point = l2.intersection(l1)
-        if(point.type=="Point"):
+        if point.geom_type == "Point":
             return [round(point.x,2) , round(point.y,2)]
         #
         #print(point.coords[:])

@@ -10,14 +10,18 @@ from pathlib import Path
 
 class Track():
     def __init__(self, *args, **kwargs):
-        project_root = Path(__file__).resolve().parent.parent
-        track_images_dir = project_root / 'assets' / 'images' / 'track1'
-        self.border_image = pyglet.image.load(str(track_images_dir / 'background.png'))
-        self.tarmac_image = pyglet.image.load(str(track_images_dir / 'tarmac.png'))
-        self.border_sprite = pyglet.sprite.Sprite(self.border_image, 0, 0)
-        self.tarmac_sprite = pyglet.sprite.Sprite(self.tarmac_image, 0, 0)
-        self.border_sprite.update(scale=1.3)
-        self.tarmac_sprite.update(scale=1.3)
+        self.headless = kwargs.get('headless', False)
+
+        if not self.headless:
+            project_root = Path(__file__).resolve().parent.parent
+            track_images_dir = project_root / 'assets' / 'images' / 'track1'
+            self.border_image = pyglet.image.load(str(track_images_dir / 'background.png'))
+            self.tarmac_image = pyglet.image.load(str(track_images_dir / 'tarmac.png'))
+            self.border_sprite = pyglet.sprite.Sprite(self.border_image, 0, 0)
+            self.tarmac_sprite = pyglet.sprite.Sprite(self.tarmac_image, 0, 0)
+            self.border_sprite.update(scale=1.3)
+            self.tarmac_sprite.update(scale=1.3)
+
         self.coords_map = []
         self.lines = np.load('track1.npy')
         self.linerings_found = False
@@ -71,6 +75,8 @@ class Track():
         
 
     def draw_self(self):
+        if self.headless:
+            return
         self.border_sprite.draw()
         self.tarmac_sprite.draw()
         # pyglet.graphics.draw(2, pyglet.gl.GL_LINES,
@@ -127,11 +133,9 @@ class Track():
         
         self.hits=0
         self.n=0
-        if (self.road.contains(Point(px,py))):
-            print ('in the road')
+        if self.road.contains(Point(px, py)):
             return True
         else:
-            print ('out of the road')
             return False
             
         for ring in self.linerings:

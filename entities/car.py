@@ -5,56 +5,53 @@ import math
 from pathlib import Path
 
 
+DEFAULT_SENSOR_LAYOUT = [(-90, 45), (90, 45)]
+HEADLESS_CAR_WIDTH = 10
+HEADLESS_CAR_HEIGHT = 18
+
+
 class Car(Component):
 
     def __init__(self, *args, **kwargs):
         """
         Creates a sprite using a car image.
+
+        Extra kwargs:
+          headless (bool): skip pyglet image/sprite creation (for training).
+          sensor_layout (list of (offset, size) tuples): sensor configuration.
         """
         super(Car, self).__init__(*args, **kwargs)
         self.speed = kwargs.get('speed', 0)
-        self.maxspeed = kwargs.get('maxspeed',5)
-        self.minspeed = kwargs.get('minspeed',-1)
-        self.orientation = kwargs.get('heading',0)
-        self.draw_sensors = kwargs.get('sensors',True)
-        self.steering=0
-        self.throttle=0
-        self.acceleration=0
-        project_root = Path(__file__).resolve().parent.parent
-        car_image_path = project_root / 'assets' / 'images' / 'Audi.png'
-        self.car_image = pyglet.image.load(str(car_image_path))
-        self.car_image.anchor_x=self.car_image.width//2
-        self.car_image.anchor_y=self.car_image.height//2
-        #self.width = self.car_image.width
-        #self.height = self.car_image.height
-        self.car_sprite = pyglet.sprite.Sprite(self.car_image, self.x, self.y)
+        self.maxspeed = kwargs.get('maxspeed', 5)
+        self.minspeed = kwargs.get('minspeed', -1)
+        self.orientation = kwargs.get('heading', 0)
+        self.draw_sensors = kwargs.get('sensors', True)
+        self.headless = kwargs.get('headless', False)
+        self.steering = 0
+        self.throttle = 0
+        self.acceleration = 0
 
-        
+        if not self.headless:
+            project_root = Path(__file__).resolve().parent.parent
+            car_image_path = project_root / 'assets' / 'images' / 'Audi.png'
+            self.car_image = pyglet.image.load(str(car_image_path))
+            self.car_image.anchor_x = self.car_image.width // 2
+            self.car_image.anchor_y = self.car_image.height // 2
+            self.car_sprite = pyglet.sprite.Sprite(self.car_image, self.x, self.y)
+            self.car_sprite.update(scale=0.15)
+            self.width = self.car_sprite.width
+            self.height = self.car_sprite.height
+        else:
+            self.width = HEADLESS_CAR_WIDTH
+            self.height = HEADLESS_CAR_HEIGHT
 
-        self.car_sprite.update(scale=0.15)
-        self.width = self.car_sprite.width
-        self.height = self.car_sprite.height
-        
         self.x_direction = 0
         self.y_direction = 1
 
-        self.sensors = []
-        #self.sensors.append(sensor(offset =0,size = 100))
-        #self.sensors.append(sensor(offset = -25,size = 100))
-        #self.sensors.append(sensor(offset = 25,size = 100))
-        #self.sensors.append(sensor(offset = -45,size = 100))
-        #self.sensors.append(sensor(offset = 45,size = 100))
-        self.sensors.append(sensor(offset = -90,size = 45))
-        self.sensors.append(sensor(offset = 90,size = 45))
-        #self.sensors.append(sensor(offset = 180,size = 100))
+        sensor_layout = kwargs.get('sensor_layout', DEFAULT_SENSOR_LAYOUT)
+        self.sensors = [sensor(offset=off, size=sz) for off, sz in sensor_layout]
 
         self.updateSensors()
-
-        #for sen in self.sensors:
-        #    sen.toString()
-
-
-        print('Car Created')
 
     def update_self(self):
         """
@@ -83,9 +80,9 @@ class Car(Component):
 
         [self.y_direction,self.x_direction] = [self.speed * math.cos(angle), self.speed * math.sin(angle)]
 
-        self.car_sprite.update(rotation=self.orientation)
-        
-    
+        if not self.headless:
+            self.car_sprite.update(rotation=self.orientation)
+
         if self.y < 0:
             self.y = 0
             self.speed = 0
@@ -108,20 +105,22 @@ class Car(Component):
         else:
             self.x -= (self.speed * self.x_direction)
             self.y -= (self.speed * self.y_direction)
-        self.car_sprite.position = (self.x, self.y)
+        if not self.headless:
+            self.car_sprite.position = (self.x, self.y)
         self.updateSensors()
 
-        
     def draw_self(self):
         """
         Draws our car sprite to screen
         :return:
         """
+        if self.headless:
+            return
 
-        if (self.draw_sensors):
+        if self.draw_sensors:
             for sensor in self.sensors:
-                self.draw_line(self.x,self.y,self.orientation+sensor.offset,sensor.size)
-        
+                self.draw_line(self.x, self.y, self.orientation + sensor.offset, sensor.size)
+
         self.car_sprite.draw()
         
         

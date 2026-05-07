@@ -13,3 +13,6 @@ venv/
 .DS_Store
 
 .vscode/
+
+models/*.pt
+runs/
