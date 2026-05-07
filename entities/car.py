@@ -2,6 +2,7 @@ import pyglet
 from system.component import Component
 import config
 import math
+from pathlib import Path
 
 
 class Car(Component):
@@ -19,7 +20,9 @@ class Car(Component):
         self.steering=0
         self.throttle=0
         self.acceleration=0
-        self.car_image = pyglet.image.load('assets\\images\\Audi.png')
+        project_root = Path(__file__).resolve().parent.parent
+        car_image_path = project_root / 'assets' / 'images' / 'Audi.png'
+        self.car_image = pyglet.image.load(str(car_image_path))
         self.car_image.anchor_x=self.car_image.width//2
         self.car_image.anchor_y=self.car_image.height//2
         #self.width = self.car_image.width
@@ -105,7 +108,7 @@ class Car(Component):
         else:
             self.x -= (self.speed * self.x_direction)
             self.y -= (self.speed * self.y_direction)
-        self.car_sprite.set_position(self.x, self.y)
+        self.car_sprite.position = (self.x, self.y)
         self.updateSensors()
 
         

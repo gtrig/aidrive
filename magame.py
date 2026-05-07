@@ -19,7 +19,7 @@ class Window(pyglet.window.Window):
 
 def draw():
     window.clear()
-    #track.draw_self()
+    track.draw_self()
     #track.draw_outline()
     
     

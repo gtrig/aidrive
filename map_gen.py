@@ -2,13 +2,16 @@ from system.tools import MapTools
 import numpy as np
 import pyglet
 from PIL import Image, ImageFilter
+from pathlib import Path
 
 class map_gen():
 
     def load_track(self):
         self.scale = 1.3
-        self.border_image = pyglet.image.load('assets\\images\\track1\\background.png')
-        self.tarmac_image = pyglet.image.load('assets\\images\\track1\\tarmac.png')
+        project_root = Path(__file__).resolve().parent
+        track_images_dir = project_root / 'assets' / 'images' / 'track1'
+        self.border_image = pyglet.image.load(str(track_images_dir / 'background.png'))
+        self.tarmac_image = pyglet.image.load(str(track_images_dir / 'tarmac.png'))
         self.border_sprite = pyglet.sprite.Sprite(self.border_image, 0, 0)
         self.tarmac_sprite = pyglet.sprite.Sprite(self.tarmac_image, 0, 0)
         self.border_sprite.update(scale=self.scale)
@@ -16,7 +19,7 @@ class map_gen():
         self.coords_map = []
         self.lines = []
 
-        img = Image.open('assets\\images\\track1\\trackmask.jpg')
+        img = Image.open(track_images_dir / 'trackmask.jpg')
         
         img = img.resize((self.tarmac_sprite.width, self.tarmac_sprite.height))
         edges = img.filter(ImageFilter.FIND_EDGES)

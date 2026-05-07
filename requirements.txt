@@ -1,0 +1,5 @@
+numpy
+pyglet<2
+Pillow
+shapely
+matplotlib
