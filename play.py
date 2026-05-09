@@ -28,12 +28,10 @@ from entities.car import Car
 from entities.track import Track
 from system.component import Component
 from system.tools import LineTools
+from system.track_registry import load as load_track_meta, list_tracks
 from env.car_env import TRAINING_SENSOR_LAYOUT, ACTIONS, SENSOR_MAX, CarEnv
 
-START_X       = 500
-START_Y       = 90
-START_HEADING = 270
-RESET_PAUSE   = 1.5   # seconds to freeze on screen after episode ends
+RESET_PAUSE = 1.5   # seconds to freeze on screen after episode ends
 
 
 def parse_args():
@@ -44,6 +42,8 @@ def parse_args():
                    help='directory scanned for the latest checkpoint on each reset')
     p.add_argument('--allow-override', action='store_true',
                    help='keyboard overrides agent while keys are held')
+    p.add_argument('--track',          type=str, default='track1',
+                   help='which track to use (any folder in assets/tracks/)')
     return p.parse_args()
 
 
@@ -52,8 +52,12 @@ def parse_args():
 # ------------------------------------------------------------------
 
 def latest_checkpoint(models_dir: str) -> Path | None:
-    """Return the most-recently-modified .pt file in models_dir, or None."""
-    pts = sorted(Path(models_dir).glob('*.pt'), key=lambda p: p.stat().st_mtime)
+    """Return the most-recently-modified DQN .pt file in models_dir, or None.
+    PPO checkpoints (ppo_*.pt) are excluded since play.py uses a DQNAgent."""
+    pts = sorted(
+        (p for p in Path(models_dir).glob('*.pt') if not p.name.startswith('ppo_')),
+        key=lambda p: p.stat().st_mtime,
+    )
     return pts[-1] if pts else None
 
 
@@ -70,11 +74,11 @@ def build_obs(car, henv, next_gate):
     return henv._observation()
 
 
-def reset_car(car):
-    car.x = START_X
-    car.y = START_Y
+def reset_car(car, sx=500, sy=90, sh=270):
+    car.x = sx
+    car.y = sy
     car.speed = 1.5    # match training start speed
-    car.orientation = START_HEADING
+    car.orientation = sh
     car.acceleration = 0
     car.steering = 0
     car.x_direction = 0
@@ -89,24 +93,32 @@ def reset_car(car):
 def main():
     args = parse_args()
 
+    available = list_tracks()
+    if args.track not in available:
+        print(f'[play] unknown track "{args.track}". Available: {available}')
+        raise SystemExit(1)
+
+    _tmeta = load_track_meta(args.track)
+    START_X_, START_Y_, START_HEADING_ = _tmeta.start_x, _tmeta.start_y, _tmeta.start_heading
+
     sensor_layout = TRAINING_SENSOR_LAYOUT if args.policy else [(-90, 45), (90, 45)]
 
     # ---- visual car & track ----
     car = Car(
-        x=START_X, y=START_Y,
+        x=START_X_, y=START_Y_,
         speed=0, maxspeed=4,
-        heading=START_HEADING,
+        heading=START_HEADING_,
         sensors=True,
         headless=False,
         sensor_layout=sensor_layout,
     )
-    track  = Track(headless=False)
+    track  = Track(headless=False, track_id=args.track)
     dlines = LineTools(sensors=car.sensors, lines=track.lines)
-    gates  = np.load('gates.npy', allow_pickle=True)
+    gates  = np.load(str(_tmeta.gates_npy), allow_pickle=True)
 
     # headless env — always created for the occupancy grid and gate normals
     # so direction-gated checks apply in both AI and human modes
-    _henv = CarEnv(sensor_layout=sensor_layout)
+    _henv = CarEnv(sensor_layout=sensor_layout, track_id=args.track)
 
     def is_on_road(x, y):
         return _henv._is_on_road(x, y)
@@ -145,7 +157,7 @@ def main():
     # ---- episode state ----
     state = {
         'next_gate':    0,
-        'prev_pos':     (START_X, START_Y),
+        'prev_pos':     (START_X_, START_Y_),
         'episode':      0,
         'gates_hit':    0,
         'step':         0,
@@ -187,7 +199,7 @@ def main():
         state['pause_until'] = time.time() + RESET_PAUSE
 
     def do_reset():
-        reset_car(car)
+        reset_car(car, START_X_, START_Y_, START_HEADING_)
         dlines.updatePOI(car.x, car.y)
         dlines.getLinesInBox()
         dlines.getIntesections()
@@ -227,7 +239,8 @@ def main():
         for line in dlines.getLinesInBox():
             pyglet.graphics.draw(
                 2, pyglet.gl.GL_LINES,
-                ('v2i', (line[0][0], line[0][1], line[1][0], line[1][1])),
+                ('v2f', (float(line[0][0]), float(line[0][1]),
+                         float(line[1][0]), float(line[1][1]))),
                 ('c3B', (255, 0, 0, 255, 0, 0)),
             )
 
@@ -339,14 +352,14 @@ def main():
             end_episode('off-road')
             return
 
-        # gate progression
-        if state['next_gate'] < len(gates):
-            if _gate_crossed(state['prev_pos'], cur, state['next_gate']):
-                state['gates_hit']  += 1
-                state['next_gate']  += 1
-                if state['next_gate'] >= len(gates):
-                    end_episode('lap complete!')
-                    return
+        # gate progression — next_gate wraps so a full circuit back to the
+        # starting gate counts as a lap, not just reaching the last gate index.
+        if _gate_crossed(state['prev_pos'], cur, state['next_gate']):
+            state['gates_hit'] += 1
+            state['next_gate']  = (state['next_gate'] + 1) % len(gates)
+            if state['gates_hit'] >= len(gates):
+                end_episode('lap complete!')
+                return
 
         state['prev_pos'] = cur
 

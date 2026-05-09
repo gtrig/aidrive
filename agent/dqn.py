@@ -45,6 +45,8 @@ class DQNAgent:
         eps_start: float = 1.0,
         eps_end: float = 0.05,
         eps_decay_steps: int = 12_000,
+        # n-step returns
+        n_step: int = 1,
         # misc
         device: str = 'cpu',
     ):
@@ -59,13 +61,14 @@ class DQNAgent:
         self.eps_start = eps_start
         self.eps_end = eps_end
         self.eps_decay_steps = eps_decay_steps
+        self.n_step = n_step
 
         self.policy_net = QNetwork(obs_dim, n_actions).to(self.device)
         self.target_net = copy.deepcopy(self.policy_net).to(self.device)
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.buffer = ReplayBuffer(buffer_capacity, obs_dim)
+        self.buffer = ReplayBuffer(buffer_capacity, obs_dim, n_step=n_step, gamma=gamma)
 
         self._total_steps = 0
         self._learn_steps = 0
@@ -119,8 +122,14 @@ class DQNAgent:
         q_values = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            next_q = self.target_net(next_states).max(1)[0]
-            targets = rewards + self.gamma * next_q * (1.0 - dones)
+            # Double DQN: policy net selects action, target net evaluates it.
+            # Reduces overestimation bias compared to plain DQN max.
+            next_actions = self.policy_net(next_states).argmax(1, keepdim=True)
+            next_q = self.target_net(next_states).gather(1, next_actions).squeeze(1)
+            # n-step gamma: γ^n is already baked into the n-step return stored in the
+            # buffer, so we only need γ^n for the bootstrap term.
+            gamma_n = self.gamma ** self.n_step
+            targets = rewards + gamma_n * next_q * (1.0 - dones)
 
         loss = nn.functional.mse_loss(q_values, targets)
 
@@ -148,6 +157,7 @@ class DQNAgent:
         torch.save({
             'obs_dim':     self.obs_dim,
             'n_actions':   self.n_actions,
+            'n_step':      self.n_step,
             'policy_net':  self.policy_net.state_dict(),
             'target_net':  self.target_net.state_dict(),
             'optimizer':   self.optimizer.state_dict(),
@@ -183,3 +193,4 @@ class DQNAgent:
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self._total_steps = ckpt.get('total_steps', 0)
         self._learn_steps = ckpt.get('learn_steps', 0)
+        self.n_step = int(ckpt.get('n_step', self.n_step))

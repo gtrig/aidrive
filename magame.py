@@ -1,16 +1,33 @@
+import argparse
+import sys
+from pathlib import Path
+
 import pyglet
+import numpy as np
 import config
 from system.component import Component
 from entities.car import Car
 from entities.track import Track
+from system.track_registry import load as load_track_meta, list_tracks
 from pyglet.window import key, FPSDisplay
 from random import randint, choice
 from system.tools import LineTools
-import numpy as np
-car = Car(x=500, y=90, speed=0, maxspeed=4, heading=270,sensors=True)
-track = Track()
-detectedlines = LineTools(sensors = car.sensors, lines = track.lines)
-gates = np.load('gates.npy')
+
+
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--track', type=str, default=list_tracks()[0] if list_tracks() else 'track1',
+                   help='track to load (any folder in assets/tracks/)')
+    return p.parse_args()
+
+
+_args = _parse_args()
+_tmeta = load_track_meta(_args.track)
+car = Car(x=_tmeta.start_x, y=_tmeta.start_y, speed=0, maxspeed=4,
+          heading=_tmeta.start_heading, sensors=True)
+track = Track(track_id=_args.track)
+detectedlines = LineTools(sensors=car.sensors, lines=track.lines)
+gates = np.load(str(_tmeta.gates_npy))
 class Window(pyglet.window.Window):
     def __init_(self,*args,**kwargs):
         super().__init__(*args,**kwargs)

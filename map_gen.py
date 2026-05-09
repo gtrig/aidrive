@@ -4,14 +4,17 @@ import pyglet
 from PIL import Image, ImageFilter
 from pathlib import Path
 
+# Source images are kept in assets/tracks/track1/ (legacy trackmask is still
+# in the old place; copy it manually if needed).
+TRACK1_IMAGES_DIR = Path(__file__).resolve().parent / 'assets' / 'tracks' / 'track1'
+TRACK1_OUTPUT_DIR = TRACK1_IMAGES_DIR   # same folder
+
 class map_gen():
 
     def load_track(self):
         self.scale = 1.3
-        project_root = Path(__file__).resolve().parent
-        track_images_dir = project_root / 'assets' / 'images' / 'track1'
-        self.border_image = pyglet.image.load(str(track_images_dir / 'background.png'))
-        self.tarmac_image = pyglet.image.load(str(track_images_dir / 'tarmac.png'))
+        self.border_image = pyglet.image.load(str(TRACK1_IMAGES_DIR / 'background.png'))
+        self.tarmac_image = pyglet.image.load(str(TRACK1_IMAGES_DIR / 'tarmac.png'))
         self.border_sprite = pyglet.sprite.Sprite(self.border_image, 0, 0)
         self.tarmac_sprite = pyglet.sprite.Sprite(self.tarmac_image, 0, 0)
         self.border_sprite.update(scale=self.scale)
@@ -19,7 +22,7 @@ class map_gen():
         self.coords_map = []
         self.lines = []
 
-        img = Image.open(track_images_dir / 'trackmask.jpg')
+        img = Image.open(TRACK1_IMAGES_DIR / 'trackmask.jpg')
         
         img = img.resize((self.tarmac_sprite.width, self.tarmac_sprite.height))
         edges = img.filter(ImageFilter.FIND_EDGES)
@@ -69,7 +72,7 @@ class map_gen():
         #for i,line in enumerate(self.lines):
         #    print(i,line,t.dist(line[0],line[1]))
         
-        np.save('track1.npy',self.lines)
+        np.save(str(TRACK1_OUTPUT_DIR / 'track.npy'), self.lines)
 
         #print(self.lines)
 

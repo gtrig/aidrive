@@ -4,6 +4,7 @@ import math
 import numpy as np
 from PIL import Image, ImageFilter
 from system.tools import MapTools
+from system.track_registry import load as load_track_meta
 from shapely.geometry import LinearRing,Point,Polygon,MultiPolygon
 from matplotlib import pyplot as plt,patches
 from pathlib import Path
@@ -11,19 +12,20 @@ from pathlib import Path
 class Track():
     def __init__(self, *args, **kwargs):
         self.headless = kwargs.get('headless', False)
+        track_id      = kwargs.get('track_id', 'track1')
+
+        meta = load_track_meta(track_id)
 
         if not self.headless:
-            project_root = Path(__file__).resolve().parent.parent
-            track_images_dir = project_root / 'assets' / 'images' / 'track1'
-            self.border_image = pyglet.image.load(str(track_images_dir / 'background.png'))
-            self.tarmac_image = pyglet.image.load(str(track_images_dir / 'tarmac.png'))
+            self.border_image = pyglet.image.load(str(meta.background_png))
+            self.tarmac_image = pyglet.image.load(str(meta.tarmac_png))
             self.border_sprite = pyglet.sprite.Sprite(self.border_image, 0, 0)
             self.tarmac_sprite = pyglet.sprite.Sprite(self.tarmac_image, 0, 0)
-            self.border_sprite.update(scale=1.3)
-            self.tarmac_sprite.update(scale=1.3)
+            self.border_sprite.update(scale=meta.image_scale)
+            self.tarmac_sprite.update(scale=meta.image_scale)
 
         self.coords_map = []
-        self.lines = np.load('track1.npy')
+        self.lines = np.load(str(meta.track_npy))
         self.linerings_found = False
         self.linerings = []
         self.find_linerings()
@@ -86,37 +88,26 @@ class Track():
     def find_linerings(self):
         if self.linerings_found:
             return
-        # t = MapTools()
-        firstpoint=self.lines[0][0]
-        points=[]
-        previousEnd =firstpoint[1]
-        #print("First point:",firstpoint)
+        firstpoint = self.lines[0][0]
+        points = []
+        previousEnd = firstpoint[1]
         self.linerings_found = True
         for line in self.lines:
-            # print (line[0],line[1],line[0]==previousEnd,end='')
-            if points==[] or (line[0]==previousEnd).all():
+            if points == [] or (line[0] == previousEnd).all():
                 points.append(line[1])
-            else: 
-                ring=Polygon(LinearRing(points))
-                #print("Ring length:",len(ring.coords))
-                #pyglet.graphics.draw(len(ring.coords), pyglet.gl.GL_LINE_LOOP,ring)
-                self.linerings.append(ring)
-                #self.plot(ring)
-                #print(ring)
-                points=[]
+            else:
+                if len(points) >= 3:
+                    self.linerings.append(Polygon(LinearRing(points)))
+                points = []
+            previousEnd = line[1]
 
-            previousEnd=line[1]
+        # Flush the last ring before computing road so that tracks with only
+        # one ring-break in the .npy file (e.g. track2) still work.
+        if len(points) >= 3:
+            self.linerings.append(Polygon(LinearRing(points)))
 
         road = self.linerings[0].difference(self.linerings[1])
         self.road = road
-        
-        
-        #object.intersects(other)
-#Returns True if the boundary or interior of the object intersect in any way with those of the other.
-
-        if points!=[]:
-            ring=Polygon(LinearRing(points))
-            self.linerings.append(ring)
 
     def plot(self,polygon):
         x, y = polygon.exterior.coords.xy
