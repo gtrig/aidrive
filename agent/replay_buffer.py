@@ -94,21 +94,32 @@ class ReplayBuffer:
                 buf.popleft()
 
     def push_batch(self, states, actions, rewards, next_states, dones):
-        """Push a batch without n-step (e.g. from plain VecEnv loop).
-        env_id is automatically derived from batch index.
-        """
-        for i in range(len(states)):
-            self.push(states[i], int(actions[i]), float(rewards[i]),
-                      next_states[i], bool(dones[i]), env_id=i)
+        """Push one transition per env row; env_id is the batch index."""
+        n = len(states)
+        if self.n_step == 1:
+            for i in range(n):
+                self._commit(
+                    states[i], int(actions[i]), float(rewards[i]),
+                    next_states[i], bool(dones[i]),
+                )
+            return
+
+        for i in range(n):
+            self.push(
+                states[i], int(actions[i]), float(rewards[i]),
+                next_states[i], bool(dones[i]), env_id=i,
+            )
 
     def sample(self, batch_size: int, device='cpu'):
         idx = np.random.choice(self._size, batch_size, replace=False)
+        dev = torch.device(device)
+        non_blocking = dev.type == 'cuda'
         return (
-            torch.from_numpy(self._states[idx]).to(device),
-            torch.from_numpy(self._actions[idx]).to(device),
-            torch.from_numpy(self._rewards[idx]).to(device),
-            torch.from_numpy(self._next_states[idx]).to(device),
-            torch.from_numpy(self._dones[idx]).to(device),
+            torch.from_numpy(self._states[idx]).to(dev, non_blocking=non_blocking),
+            torch.from_numpy(self._actions[idx]).to(dev, non_blocking=non_blocking),
+            torch.from_numpy(self._rewards[idx]).to(dev, non_blocking=non_blocking),
+            torch.from_numpy(self._next_states[idx]).to(dev, non_blocking=non_blocking),
+            torch.from_numpy(self._dones[idx]).to(dev, non_blocking=non_blocking),
         )
 
     def __len__(self):

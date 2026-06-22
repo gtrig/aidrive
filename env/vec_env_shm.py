@@ -116,7 +116,23 @@ class ShmVecEnv:
         project_root = str(Path(__file__).resolve().parent.parent)
         if project_root not in sys.path:
             sys.path.insert(0, project_root)
-        from env.car_env import CarEnv, ACTIONS
+        import config
+        from env.car_env import CarEnv, ACTIONS, get_shared_occupancy
+        from entities.track import Track
+
+        track_id = env_kwargs.get('track_id', 'track1')
+        if env_kwargs.get('occupancy_grid') is None:
+            _track = Track(headless=True, track_id=track_id)
+            env_kwargs = {
+                **env_kwargs,
+                'occupancy_grid': get_shared_occupancy(
+                    track_id,
+                    _track.road,
+                    config.window_width,
+                    config.window_height,
+                ),
+            }
+
         _probe = CarEnv(**env_kwargs)
         obs0, _ = _probe.reset()
         self.obs_dim   = obs0.shape[0]
@@ -188,8 +204,8 @@ class ShmVecEnv:
     def reset(self) -> np.ndarray:
         """Trigger a full reset on all workers, return obs array."""
         # Workers already auto-reset on done; this is a hard reset for init.
-        # Re-use the initial obs already in shared memory.
-        return self._obs_arr.copy()
+        # Copy once so callers own the initial observation buffer.
+        return np.array(self._obs_arr, copy=True)
 
     def send_actions(self, actions: np.ndarray):
         """Write actions and fire step_events (non-blocking — async half)."""
@@ -198,27 +214,28 @@ class ShmVecEnv:
             ev.set()
 
     def recv_results(self):
-        """Block until all workers have finished stepping, then read results."""
+        """Block until all workers have finished stepping, then read results.
+
+        Returns shared-memory views for obs/rewards (valid until the next
+        send_actions).  Callers must copy obs before retaining across steps.
+        """
         for ev in self._done_events:
             ev.wait()
             ev.clear()
 
-        obs     = self._obs_arr.copy()
-        rewards = self._reward_arr.copy()
-        dones   = self._done_arr.copy().astype(bool)
-        reason_codes = self._reason_arr.copy()
-        lap_steps    = self._lap_steps_arr.copy()
-        lap_bonus    = self._lap_bonus_arr.copy()
+        obs     = self._obs_arr
+        rewards = self._reward_arr
+        dones   = self._done_arr > 0
         infos = []
         for i in range(self.n_envs):
-            reason = self.REASON_NAMES.get(int(reason_codes[i]), 'off_road')
+            reason = self.REASON_NAMES.get(int(self._reason_arr[i]), 'off_road')
             info   = {
                 'gates_hit': int(self._gates_arr[i]),
                 'reason':    reason,
             }
             if reason == 'lap_complete':
-                info['lap_steps']      = int(lap_steps[i])
-                info['lap_time_bonus'] = float(lap_bonus[i])
+                info['lap_steps']      = int(self._lap_steps_arr[i])
+                info['lap_time_bonus'] = float(self._lap_bonus_arr[i])
             infos.append(info)
         return obs, rewards, dones, infos
 

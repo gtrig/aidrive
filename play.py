@@ -107,6 +107,7 @@ def main():
     car = Car(
         x=START_X_, y=START_Y_,
         speed=0, maxspeed=4,
+        minspeed=0,
         heading=START_HEADING_,
         sensors=True,
         headless=False,
@@ -335,7 +336,7 @@ def main():
         # AI or human driving
         if agent and not keys_held:
             obs = build_obs(car, _henv, state['next_gate'])
-            accel, steer = ACTIONS[agent.act(obs, eval=False)]
+            accel, steer = ACTIONS[agent.act(obs, eval=True)]
             car.accelerate(accel)
             car.turn(steer)
 

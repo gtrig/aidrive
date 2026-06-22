@@ -18,18 +18,18 @@ from system.track_registry import load as load_track_meta
 TRAINING_SENSOR_LAYOUT = [(-90, 80), (-45, 100), (-20, 150), (0, 200), (20, 150), (45, 100), (90, 80)]
 
 # Discrete action set: (acceleration, steering_degrees)
-# Steering reduced to ±3° for more stable random exploration;
-# ±7° added for tight corners.
 ACTIONS = [
-    (0.05,  0),   # 0 – throttle straight   (most likely during exploration)
-    (0.0,   0),   # 1 – coast
-    (-0.1,  0),   # 2 – brake
-    (0, -3),       # 3 – turn left
-    (0, +3),       # 4 – turn right
-    (-0.1, -3),    # 5 – brake + turn left
-    (-0.1, +3),    # 6 – brake + turn right
-    (0, -6),       # 5 – turn sharp left
-    (0, +6),       # 6 – turn sharp right
+    (0.05,  0),    # 0 – throttle straight
+    (0.0,   0),    # 1 – coast
+    (-0.1,  0),    # 2 – brake
+    (0, -4),        # 3 – turn left
+    (0, +4),        # 4 – turn right
+    (0, -12),       # 5 – sharp left  (±6 was too weak for hairpins)
+    (0, +12),       # 6 – sharp right
+    (0.05, -4),     # 7 – throttle + turn left
+    (0.05, +4),     # 8 – throttle + turn right
+    (0.05, -12),    # 9 – throttle + sharp left
+    (0.05, +12),    # 10 – throttle + sharp right
 ]
 
 # Reward weights
@@ -38,15 +38,30 @@ R_LAP         = 10.0    # flat bonus for completing a full lap
 R_LAP_TIME    = 20.0    # additional time bonus: R_LAP_TIME * (1 - steps / LAP_REF_STEPS)
 LAP_REF_STEPS = 2000    # reference lap (slowest acceptable); faster → more bonus
 R_APPROACH    =  0.004  # per px closer to the next gate midpoint (dense signal)
-R_SPEED       =  0.005  # per unit of speed on road
+R_FORWARD     =  0.02   # per px of movement along the track-forward gate normal
+R_SPEED       =  0.008  # per unit of track-aligned forward speed
+R_WRONG_WAY   =  0.015  # per unit of speed when heading opposes track forward
+R_ON_ROAD     =  0.004  # per step while still on track (offsets time pressure)
 R_OFF_ROAD    = -5.0    # episode-ending penalty
-R_TIME        = -0.01  # small per-step time pressure
+R_TIME        = -0.002  # mild per-step pressure (was -0.01 → -20/ep at timeout)
 
 MAX_STEPS     = 2000
 
 # Normalisation constants
 SENSOR_MAX   = 200.0    # longest sensor size
 DIST_MAX     = 1500.0   # approx max gate-to-gate distance on track
+
+# Per-track occupancy grids built once and shared across all env workers.
+_OCCUPANCY_CACHE: dict[str, np.ndarray] = {}
+
+
+def get_shared_occupancy(track_id: str, road_polygon, width: int, height: int) -> np.ndarray:
+    """Return a cached read-only occupancy grid for track_id."""
+    if track_id not in _OCCUPANCY_CACHE:
+        _OCCUPANCY_CACHE[track_id] = CarEnv._build_occupancy_grid(
+            road_polygon, width, height,
+        )
+    return _OCCUPANCY_CACHE[track_id]
 
 
 class CarEnv:
@@ -56,8 +71,10 @@ class CarEnv:
         obs, reward, done, info = env.step(action)
 
     Observation vector (obs_dim = n_sensors + 1 + 3):
-        [sensor_0..n_norm, speed_norm,
+        [sensor_0..n_norm, track_speed_norm,
          dist_to_next_gate_norm, sin(heading_diff), cos(heading_diff)]
+        track_speed_norm is signed: positive along track forward, negative when
+        the car faces / drives the wrong way.
     """
 
     def __init__(
@@ -68,6 +85,7 @@ class CarEnv:
         track_npy=None,
         rand_start: bool = False,
         track_id: str = 'track1',
+        occupancy_grid: np.ndarray | None = None,
     ):
         self.sensor_layout = sensor_layout or TRAINING_SENSOR_LAYOUT
         self.max_steps = max_steps
@@ -81,9 +99,12 @@ class CarEnv:
 
         gates_file = Path(gates_path) if gates_path else _meta.gates_npy
 
+        # minspeed=0: default Car mins=-1 lets sustained braking enter reverse; dense
+        # R_APPROACH then rewards sliding toward the gate midpoint without crossing it.
         self.car = Car(
             x=self._start_x, y=self._start_y,
             speed=0, maxspeed=4,
+            minspeed=0,
             heading=self._start_heading,
             sensors=False,
             headless=True,
@@ -103,11 +124,15 @@ class CarEnv:
             for g in self.gates
         ]
 
-        self._occupancy = self._build_occupancy_grid(
-            self.track.road,
-            config.window_width,
-            config.window_height,
-        )
+        if occupancy_grid is not None:
+            self._occupancy = occupancy_grid
+        else:
+            self._occupancy = get_shared_occupancy(
+                track_id,
+                self.track.road,
+                config.window_width,
+                config.window_height,
+            )
 
         # obs: n_sensors + speed + dist_to_gate + sin(angle) + cos(angle)
         self.obs_dim   = len(self.sensor_layout) + 1 + 3
@@ -177,7 +202,7 @@ class CarEnv:
         self.line_tools.getLinesInBox()
         self.line_tools.getIntesections()
 
-        reward = R_TIME
+        reward = R_TIME + R_ON_ROAD
         done   = False
         info   = {}
 
@@ -190,13 +215,31 @@ class CarEnv:
             self._prev_pos = (self.car.x, self.car.y)
             return self._observation(), reward, done, info
 
-        # speed reward
-        reward += R_SPEED * max(self.car.speed, 0)
+        alignment = self._track_alignment()
+        speed = max(self.car.speed, 0)
 
-        # dense approach reward: reward for getting closer to the next gate
+        # Speed reward only when heading aligns with track forward — raw speed
+        # rewarded the agent for throttling while facing backward.
+        reward += R_SPEED * speed * max(alignment, 0.0)
+        if alignment < 0.0 and speed > 0.0:
+            reward -= R_WRONG_WAY * speed
+
         cur_pos  = (self.car.x, self.car.y)
         cur_dist = self._dist_to_next_gate(self.car.x, self.car.y)
-        reward  += R_APPROACH * (self._prev_dist - cur_dist)
+
+        # Forward progress along the track direction (gate normal).  Rewards
+        # driving the right way; penalises backing/sliding against track flow.
+        nx, ny = self._gate_normals[self._next_gate]
+        nlen = math.hypot(nx, ny) or 1.0
+        mvx = cur_pos[0] - self._prev_pos[0]
+        mvy = cur_pos[1] - self._prev_pos[1]
+        forward_progress = (mvx * nx + mvy * ny) / nlen
+        reward += R_FORWARD * forward_progress
+
+        # Dense approach reward only when advancing along the track — otherwise
+        # the agent can face backward, throttle "forward", and farm gate distance.
+        if forward_progress > 0:
+            reward += R_APPROACH * (self._prev_dist - cur_dist)
         self._prev_dist = cur_dist
 
         # gate crossing (forward direction only)
@@ -233,6 +276,16 @@ class CarEnv:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _track_alignment(self, gate_idx: int | None = None) -> float:
+        """Cosine of angle between car heading and the track-forward gate normal."""
+        idx = self._next_gate if gate_idx is None else gate_idx
+        nx, ny = self._gate_normals[idx]
+        nlen = math.hypot(nx, ny) or 1.0
+        heading_rad = math.radians(self.car.orientation)
+        fx = math.sin(heading_rad)
+        fy = math.cos(heading_rad)
+        return (fx * nx + fy * ny) / nlen
+
     def _dist_to_next_gate(self, x, y):
         if self._next_gate >= self.n_gates:
             return 0.0
@@ -241,12 +294,14 @@ class CarEnv:
 
     def _observation(self):
         """
-        [sensor_0..n normalised, speed_norm,
+        [sensor_0..n normalised, track_speed_norm,
          dist_to_next_gate_norm, sin(heading_diff), cos(heading_diff)]
         heading_diff = angle from car orientation to direction of next gate.
         """
         obs = [min(s.distance, SENSOR_MAX) / SENSOR_MAX for s in self.car.sensors]
-        obs.append(self.car.speed / self.car.maxspeed)
+        alignment = self._track_alignment()
+        track_speed_norm = (self.car.speed * alignment) / self.car.maxspeed
+        obs.append(float(np.clip(track_speed_norm, -1.0, 1.0)))
 
         # navigation features
         if self._next_gate < self.n_gates:

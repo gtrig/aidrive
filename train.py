@@ -14,6 +14,7 @@ import os
 import random
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,13 +29,58 @@ from env.vec_env_shm import ShmVecEnv
 from agent.dqn import DQNAgent
 from system.track_registry import list_tracks
 
+# Median episode length from runs/*.csv (~1.1k–1.9k steps); used to size ε decay
+# instead of max_steps (2k), which made exploration collapse too early.
+AVG_EP_STEPS = 1500
+# Best session (run_20260509_171847) kept ε≥0.30 and reached ~44 gates/ep; runs that
+# hit ε=0.05 early stagnated below 3 gates/ep.
+EPS_DECAY_FRACTION = 0.55
+
+
+def _is_better_episode(ep_g: int, ep_r: float, best_g: int, best_r: float) -> bool:
+    """Prefer more gates; break ties with reward. Ignore 0-gate regressions."""
+    if ep_g > best_g:
+        return True
+    if ep_g == best_g and ep_g > 0 and ep_r > best_r:
+        return True
+    return False
+
+
+def evaluate_agent(agent: DQNAgent, env_kwargs: dict, n_episodes: int = 5) -> tuple[float, int]:
+    """Greedy rollouts (no ε) — measures actual policy quality."""
+    from env.car_env import CarEnv
+
+    env = CarEnv(**env_kwargs)
+    gates = []
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        info = {}
+        while not done:
+            action = agent.act(obs, eval=True)
+            obs, _, done, info = env.step(action)
+        gates.append(int(info.get('gates_hit', 0)))
+    return float(np.mean(gates)), max(gates)
+
+
+def _resolve_checkpoint(models_dir: str, explicit: str | None) -> str | None:
+    """Pick checkpoint: explicit --load, else dqn_best.pt, else dqn_final.pt."""
+    if explicit:
+        return explicit
+    root = Path(models_dir)
+    for name in ('dqn_best.pt', 'dqn_final.pt'):
+        path = root / name
+        if path.is_file():
+            return str(path)
+    return None
+
 
 def parse_args():
     default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     p = argparse.ArgumentParser(description='Train DQN car agent')
     p.add_argument('--episodes',    type=int, default=3000,
                    help='number of training episodes (per virtual env)')
-    p.add_argument('--n-envs',      type=int, default=4,
+    p.add_argument('--n-envs',      type=int, default=8,
                    help='number of parallel environments')
     p.add_argument('--max-steps',   type=int, default=2000,
                    help='max steps per episode')
@@ -42,16 +88,28 @@ def parse_args():
                    help='run one gradient update every N env steps')
     p.add_argument('--n-step',      type=int, default=3,
                    help='n-step return horizon (1 = plain 1-step DQN)')
-    p.add_argument('--eps-decay',   type=int, default=12_000,
-                   help='gradient steps to decay epsilon from 1.0 → 0.05')
+    p.add_argument('--eps-decay',   type=int, default=None,
+                   help='env steps to decay epsilon from 1.0 → eps-end '
+                        '(default: ~55%% of expected total env steps for this run)')
+    p.add_argument('--eps-end',     type=float, default=0.20,
+                   help='minimum exploration rate (best runs stayed ≥0.30)')
+    p.add_argument('--lr',          type=float, default=5e-4,
+                   help='Adam learning rate')
     p.add_argument('--reset-eps',   action='store_true',
                    help='reset epsilon to 1.0 after loading a checkpoint (re-explore)')
     p.add_argument('--save-every',  type=int, default=100,
                    help='save checkpoint every N episodes')
+    p.add_argument('--eval-every',  type=int, default=100,
+                   help='run greedy eval every N completed episodes')
+    p.add_argument('--eval-episodes', type=int, default=5,
+                   help='greedy episodes per eval (used for dqn_best.pt)')
     p.add_argument('--seed',        type=str, default=None,
                    help='random seed')
     p.add_argument('--load',        type=str, default=None,
-                   help='checkpoint .pt file to resume from')
+                   help='checkpoint .pt file to resume from (weights, optimizer, '
+                        'exploration step count, CSV episode index, best metrics)')
+    p.add_argument('--fresh',       action='store_true',
+                   help='train from scratch (do not auto-load dqn_best.pt)')
     p.add_argument('--runs-dir',    type=str, default='runs',
                    help='directory for CSV logs')
     p.add_argument('--models-dir',  type=str, default='models',
@@ -62,13 +120,24 @@ def parse_args():
                    choices=['pipe', 'shm'],
                    help='VecEnv backend: pipe (original) or shm (async shared-memory)')
     p.add_argument('--rand-start',  action='store_true',
-                   help='start each episode at a random gate instead of the fixed start position')
+                   help='start each episode at a random gate (use after basic driving works)')
     p.add_argument('--track',       type=str, default='track1',
                    help='which track to train on (any folder in assets/tracks/)')
+    p.add_argument('--buffer-capacity', type=int, default=100_000,
+                   help='replay buffer size (larger helps long runs; more RAM)')
     args = p.parse_args()
     available = list_tracks()
     if args.track not in available:
         p.error(f'unknown track "{args.track}". Available: {available}')
+
+    # Size ε decay from recorded session episode lengths, not max_steps ceiling.
+    if args.eps_decay is None:
+        est_env_steps = args.episodes * args.n_envs * AVG_EP_STEPS
+        args.eps_decay = max(100_000, int(est_env_steps * EPS_DECAY_FRACTION))
+
+    if not args.fresh:
+        args.load = _resolve_checkpoint(args.models_dir, args.load)
+
     return args
 
 
@@ -169,6 +238,28 @@ def set_seed(seed):
     torch.manual_seed(s)
 
 
+class AsyncSaver:
+    """Write checkpoints on a background thread to avoid I/O spikes."""
+
+    def __init__(self):
+        self._thread: threading.Thread | None = None
+
+    def save(self, agent: DQNAgent, path: str, **kwargs):
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join()
+        self._thread = threading.Thread(
+            target=agent.save,
+            args=(path,),
+            kwargs=kwargs,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def flush(self):
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join()
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -184,8 +275,9 @@ def main():
     # ----------------------------------------------------------------
     print('Initialising environments (building occupancy grids)...')
     t_init = time.perf_counter()
+    _use_rand_start = args.rand_start
     _env_kwargs = dict(sensor_layout=TRAINING_SENSOR_LAYOUT, max_steps=args.max_steps,
-                       rand_start=args.rand_start, track_id=args.track)
+                       rand_start=_use_rand_start, track_id=args.track)
     if args.vec_impl == 'shm':
         vec_env = ShmVecEnv(n_envs=args.n_envs, **_env_kwargs)
     else:
@@ -202,21 +294,44 @@ def main():
         obs_dim=obs_dim,
         n_actions=n_actions,
         device=args.device,
+        lr=args.lr,
+        eps_end=args.eps_end,
         eps_decay_steps=args.eps_decay,
         n_step=args.n_step,
+        buffer_capacity=args.buffer_capacity,
     )
 
+    resume_base = 0
     if args.load:
         print(f'Resuming from {args.load}')
         try:
             agent.load(args.load)
+            resume_base = agent.resume_global_episode
+            bg = agent.resume_best_gates
+            br = agent.resume_best_reward
+            print(f'  checkpoint: completed_episodes={resume_base}  '
+                  f'learn_steps={agent._learn_steps}  epsilon={agent.epsilon():.4f}  '
+                  f'best_gates={bg if bg is not None else "?"}  '
+                  f'best_reward={br if br is not None else "?"}')
         except ValueError as e:
             print(f'[train] {e}')
             print('[train] Starting from a fresh model instead.')
             args.load = None
         if args.reset_eps:
             agent._total_steps = 0
-            print(f'  epsilon reset to 1.0 (will decay over {args.eps_decay} gradient steps)')
+            agent._learn_steps = 0
+            agent._explore_env_steps = 0
+            print(f'  epsilon reset to 1.0 (will decay over {args.eps_decay} env steps)')
+        elif agent._explore_env_steps > 0:
+            # Extend ε horizon so resume does not snap to eps_end when the new
+            # run's eps_decay is shorter than steps already explored.
+            extended = agent._explore_env_steps + int(
+                args.episodes * args.n_envs * AVG_EP_STEPS * EPS_DECAY_FRACTION
+            )
+            if extended > args.eps_decay:
+                args.eps_decay = extended
+                agent.eps_decay_steps = extended
+                print(f'  extended eps_decay to {args.eps_decay} env steps for resume')
 
     # ----------------------------------------------------------------
     # CSV logging
@@ -230,8 +345,9 @@ def main():
                      'epsilon', 'steps_per_sec'])
 
     print(f'obs_dim={obs_dim}  n_actions={n_actions}  '
-          f'batch={agent.batch_size}  update_every={args.update_every}  '
-          f'n_step={args.n_step}')
+          f'batch={agent.batch_size}  buffer={args.buffer_capacity}  '
+          f'update_every={args.update_every}  n_step={args.n_step}  '
+          f'lr={args.lr}  eps_end={args.eps_end}  eps_decay={args.eps_decay}')
     print(f'Logs -> {csv_path}')
     print('-' * 70)
 
@@ -242,13 +358,30 @@ def main():
     ep_rewards  = np.zeros(args.n_envs, dtype=np.float32)
     ep_steps    = np.zeros(args.n_envs, dtype=np.int32)
 
-    episode_count = 0
-    global_steps  = 0
-    best_reward   = float('-inf')
+    episode_count = resume_base
+    global_steps  = agent._explore_env_steps if args.load else 0
+    best_gates    = (
+        agent.resume_best_gates
+        if agent.resume_best_gates is not None
+        else -1
+    )
+    best_reward   = (
+        agent.resume_best_reward
+        if agent.resume_best_reward is not None
+        else float('-inf')
+    )
+    best_eval_gates = (
+        agent.resume_best_eval_gates
+        if agent.resume_best_eval_gates is not None
+        else -1.0
+    )
     t_start       = time.perf_counter()
+    ckpt_saver    = AsyncSaver()
 
-    total_episodes = args.episodes * args.n_envs   # wall-clock equivalent
+    total_episodes = args.episodes * args.n_envs   # completions in this session
+    episode_goal   = resume_base + total_episodes
     bar = ProgressBar(total=total_episodes)
+    _shm_views = args.vec_impl == 'shm'
 
     # Whether this backend supports async send/recv pipelining
     _async = hasattr(vec_env, 'send_actions') and hasattr(vec_env, 'recv_results')
@@ -258,7 +391,7 @@ def main():
         actions = agent.act_batch(obs)
         vec_env.send_actions(actions)
 
-    while episode_count < total_episodes:
+    while episode_count < episode_goal:
         if _async:
             # --- async pipeline: learn while workers are stepping ---
             # agent.learn() runs on GPU while workers compute env.step
@@ -275,13 +408,12 @@ def main():
             next_obs, rewards, dones, infos = vec_env.step(actions)
             next_actions = actions   # used for buffer push below
 
-        for i in range(args.n_envs):
-            agent.buffer.push(obs[i], actions[i], rewards[i], next_obs[i], dones[i],
-                              env_id=i)
+        agent.buffer.push_batch(obs, actions, rewards, next_obs, dones)
 
         ep_rewards += rewards
         ep_steps   += 1
         global_steps += args.n_envs
+        agent.set_exploration_env_steps(global_steps)
 
         # --- log completed episodes ---
         for i in np.where(dones)[0]:
@@ -310,25 +442,50 @@ def main():
                     sps=sps,
                 )
 
-            if ep_r > best_reward:
-                best_reward = ep_r
-                agent.save(os.path.join(args.models_dir, 'dqn_best.pt'))
-                bar.log(f'  -> best  {os.path.join(args.models_dir, "dqn_best.pt")}  (reward {ep_r:.2f})', sps=sps)
+            if episode_count % args.eval_every == 0:
+                eval_mean, eval_max = evaluate_agent(
+                    agent, _env_kwargs, n_episodes=args.eval_episodes,
+                )
+                if eval_mean > best_eval_gates:
+                    best_eval_gates = eval_mean
+                    best_gates = eval_max
+                    best_reward = ep_r
+                    ckpt_saver.save(
+                        agent,
+                        os.path.join(args.models_dir, 'dqn_best.pt'),
+                        global_episode=episode_count,
+                        best_reward=best_reward,
+                        best_gates=best_gates,
+                        best_eval_gates=best_eval_gates,
+                    )
+                    bar.log(
+                        f'  -> best  {os.path.join(args.models_dir, "dqn_best.pt")}  '
+                        f'(eval gates {eval_mean:.1f} avg / {eval_max} max)',
+                        sps=sps,
+                    )
 
             if episode_count % args.save_every == 0:
                 ckpt = os.path.join(args.models_dir, f'dqn_{episode_count}.pt')
-                agent.save(ckpt)
+                ckpt_saver.save(
+                    agent,
+                    ckpt,
+                    global_episode=episode_count,
+                    best_reward=best_reward,
+                    best_gates=best_gates,
+                    best_eval_gates=best_eval_gates,
+                )
                 bar.log(f'  -> saved {ckpt}', sps=sps)
 
             # reset per-env accumulators
             ep_rewards[i] = 0.0
             ep_steps[i]   = 0
 
-        # redraw bar every step (cheap — just overwrites the current line)
-        elapsed = max(time.perf_counter() - t_start, 1e-6)
-        bar.update(episode_count, sps=global_steps / elapsed)
+        if episode_count > resume_base or global_steps % 50 == 0:
+            elapsed = max(time.perf_counter() - t_start, 1e-6)
+            bar.update(episode_count - resume_base, sps=global_steps / elapsed)
 
-        obs     = next_obs
+        # Retain a stable obs buffer when recv returns shared-memory views.
+        obs     = np.array(next_obs, copy=True) if _shm_views else next_obs
         actions = next_actions   # for next buffer push iteration
 
         # --- gradient update every N env steps (synchronous path only) ---
@@ -340,10 +497,22 @@ def main():
     # ----------------------------------------------------------------
     vec_env.close()
     csv_file.close()
-    agent.save(os.path.join(args.models_dir, 'dqn_final.pt'))
+    ckpt_saver.flush()
+    eval_mean, eval_max = evaluate_agent(
+        agent, _env_kwargs, n_episodes=args.eval_episodes,
+    )
+    agent.save(
+        os.path.join(args.models_dir, 'dqn_final.pt'),
+        global_episode=episode_count,
+        best_reward=best_reward,
+        best_gates=best_gates,
+        best_eval_gates=max(best_eval_gates, eval_mean),
+    )
     elapsed = time.perf_counter() - t_start
     bar.close(
-        f'\nTraining complete in {elapsed:.0f}s  |  best reward: {best_reward:.2f}\n'
+        f'\nTraining complete in {elapsed:.0f}s  |  '
+        f'best eval gates: {max(best_eval_gates, eval_mean):.1f}  '
+        f'final eval: {eval_mean:.1f} avg / {eval_max} max\n'
         f'Final checkpoint: {args.models_dir}/dqn_final.pt'
     )
 

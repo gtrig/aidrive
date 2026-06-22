@@ -69,6 +69,23 @@ class VecEnv:
         self._parent_conns = []
         self._processes = []
 
+        import config
+        from env.car_env import get_shared_occupancy
+        from entities.track import Track
+
+        track_id = env_kwargs.get('track_id', 'track1')
+        if env_kwargs.get('occupancy_grid') is None:
+            _track = Track(headless=True, track_id=track_id)
+            env_kwargs = {
+                **env_kwargs,
+                'occupancy_grid': get_shared_occupancy(
+                    track_id,
+                    _track.road,
+                    config.window_width,
+                    config.window_height,
+                ),
+            }
+
         ctx = mp.get_context('fork')   # 'fork' is default on Linux; fast startup
         for _ in range(n_envs):
             parent_conn, child_conn = ctx.Pipe()

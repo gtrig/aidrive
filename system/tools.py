@@ -66,7 +66,9 @@ class LineTools():
         self.poi_x_min = 0
         self.poi_y_max = 0
         self.poi_y_min = 0
-        self.linesSample = []
+        self._lines_sample_list = None   # lazy Python list for play.py / tests
+        self._lines_sample_arr = None    # (M, 2, 2) numpy — hot path for training
+        self._rays_buf = None            # (S, 2, 2) reused sensor ray buffer
 
         # Pre-build a (N, 2, 2) float32 array of all track lines for fast
         # box-filtering and vectorised intersection.  Re-built lazily whenever
@@ -100,15 +102,25 @@ class LineTools():
         self.poi_y_max = self.poi_y + self.poi_r
         self.poi_y_min = self.poi_y - self.poi_r
 
+    @property
+    def linesSample(self):
+        """Lazy Python list built only when callers iterate (play.py, tests)."""
+        if self._lines_sample_arr is None:
+            return []
+        if self._lines_sample_list is None:
+            self._lines_sample_list = self._lines_sample_arr.tolist()
+        return self._lines_sample_list
+
     def getLinesInBox(self):
-        """Return (and cache in self.linesSample) track lines inside the POI box.
+        """Return track lines inside the POI box as a numpy sub-array.
 
         Uses a NumPy boolean mask over the pre-built lines array when available,
         falling back to the original Python loop for correctness.
         """
         if self._lines_arr is None or len(self._lines_arr) == 0:
-            self.linesSample = []
-            return self.linesSample
+            self._lines_sample_arr = np.zeros((0, 2, 2), dtype=np.float32)
+            self._lines_sample_list = None
+            return self._lines_sample_arr
 
         arr = self._lines_arr          # (N, 2, 2)
         xmin, xmax = self.poi_x_min, self.poi_x_max
@@ -126,11 +138,9 @@ class LineTools():
             (y1 >= ymin) & (y1 <= ymax)
         )
 
-        # Store numpy sub-array for fast intersection; also keep list for
-        # callers that iterate over self.linesSample directly (e.g. play.py).
         self._lines_sample_arr = arr[inside]          # (M, 2, 2)
-        self.linesSample = self._lines_arr[inside].tolist()
-        return self.linesSample
+        self._lines_sample_list = None                # invalidate lazy list
+        return self._lines_sample_arr
 
     def getIntesections(self):
         """Update each sensor's distance using a fully-vectorised NumPy solver.
@@ -141,14 +151,9 @@ class LineTools():
         if not sensors:
             return []
 
-        lines_arr = getattr(self, '_lines_sample_arr', None)
-        # If getLinesInBox was not called yet (shouldn't happen in normal use),
-        # build the sample array from the Python list fallback.
+        lines_arr = self._lines_sample_arr
         if lines_arr is None:
-            if self.linesSample:
-                lines_arr = np.array(self.linesSample, dtype=np.float32)
-            else:
-                lines_arr = np.zeros((0, 2, 2), dtype=np.float32)
+            lines_arr = np.zeros((0, 2, 2), dtype=np.float32)
 
         S = len(sensors)
         L = len(lines_arr)
@@ -158,12 +163,15 @@ class LineTools():
                 s.reset()
             return []
 
-        # Build sensor ray array: shape (S, 2, 2)
-        # Each row: [[p1x, p1y], [p2x, p2y]]
-        rays = np.array(
-            [[[s.p1[0], s.p1[1]], [s.p2[0], s.p2[1]]] for s in sensors],
-            dtype=np.float32,
-        )                              # (S, 2, 2)
+        # Reuse pre-allocated ray buffer; update in-place from sensor endpoints.
+        if self._rays_buf is None or self._rays_buf.shape[0] != S:
+            self._rays_buf = np.empty((S, 2, 2), dtype=np.float32)
+        rays = self._rays_buf
+        for i, s in enumerate(sensors):
+            rays[i, 0, 0] = s.p1[0]
+            rays[i, 0, 1] = s.p1[1]
+            rays[i, 1, 0] = s.p2[0]
+            rays[i, 1, 1] = s.p2[1]
 
         # Broadcast to (S, L, 2, 2)
         r  = rays[:, np.newaxis, :, :]      # (S, 1, 2, 2)
