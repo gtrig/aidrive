@@ -47,10 +47,15 @@ R_PROGRESS      =  0.01    # per px closer to the next gate midpoint (signed)
 R_SPEED_ALIGN   =  0.005   # per unit of forward-aligned speed (breaks stalling)
 R_GATE          =  5.0     # discrete bonus for crossing the next gate
 R_GATE_SPEED    =  5.0     # max extra bonus for a fast gate-to-gate split
-GATE_REF_STEPS  = 30       # reference split length; faster segments earn more
+# Set below the best-policy average split (~6 steps) so speed bonuses are not
+# saturated and PPO still gets a gradient signal to push lap times down.
+GATE_REF_STEPS  = 14
 R_LAP           = 50.0     # flat bonus for completing a full lap
 R_OFF_ROAD      = -20.0    # terminal penalty for leaving the track
 R_TIME          = -0.002   # mild per-step cost (2000 * -0.002 = -4 total)
+
+# Bump when reward constants change so checkpoints don't compare incompatible scores.
+REWARD_VERSION  = 2
 
 MAX_STEPS   = 2000
 

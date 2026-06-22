@@ -25,7 +25,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from env.car_env import TRAINING_SENSOR_LAYOUT
+from env.car_env import TRAINING_SENSOR_LAYOUT, REWARD_VERSION
 from env.vec_env import VecEnv
 from agent.ppo import PPOAgent
 from agent.rollout_buffer import RolloutBuffer
@@ -109,6 +109,9 @@ def parse_args() -> argparse.Namespace:
                    help='linearly anneal learning rate to 0 over total-steps (default: on)')
     p.add_argument('--no-anneal-lr', dest='anneal_lr', action='store_false',
                    help='disable learning rate annealing')
+    p.add_argument('--finetune', action='store_true',
+                   help='fine-tune mode: lower LR, tighter clip, moderate entropy '
+                        '(use when lap completion has plateaued)')
 
     # misc
     p.add_argument('--seed',        type=str,   default=None)
@@ -127,6 +130,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument('--models-dir',  type=str,   default='models')
 
     args = p.parse_args()
+
+    if args.finetune:
+        args.lr = min(args.lr, 5e-5)
+        args.ent_coef = max(args.ent_coef, 0.08)
+        args.clip = min(args.clip, 0.1)
 
     available = list_tracks()
     if args.track not in available:
@@ -249,6 +257,8 @@ def main():
     print(f'Device   : {args.device}')
     print(f'Envs     : {args.n_envs}  horizon={args.horizon}  '
           f'total_steps={args.total_steps:,}')
+    if args.finetune:
+        print(f'Finetune : lr={args.lr}  ent_coef={args.ent_coef}  clip={args.clip}')
 
     # ── Vectorised environment ────────────────────────────────────────────────
     print('Initialising environments…')
@@ -317,10 +327,20 @@ def main():
 
     episode_count  = resume_episode
     global_steps   = agent._total_env_steps
-    best_score: float = (
-        float(agent.resume_best_score)
-        if agent.resume_best_score is not None else float('-inf')
-    )
+    session_start_steps = global_steps
+    session_target_steps = session_start_steps + args.total_steps
+    best_score: float = float('-inf')
+    if (
+        agent.resume_best_score is not None
+        and agent.resume_reward_version == REWARD_VERSION
+    ):
+        best_score = float(agent.resume_best_score)
+    elif agent.resume_best_score is not None:
+        print(
+            f'  reward scale changed (v{agent.resume_reward_version} → '
+            f'v{REWARD_VERSION}) — best score reset (was '
+            f'{agent.resume_best_score:.1f})'
+        )
     best_ckpt_path = Path(args.models_dir) / 'ppo_best.pt'
 
     def save_if_best(score: float, episode: int, label: str, sps: float) -> bool:
@@ -347,13 +367,17 @@ def main():
     ckpt_saver = AsyncSaver()
     bar        = ProgressBar(total=args.total_steps)
 
+    print(f'Session  : {session_start_steps:,} → {session_target_steps:,} env steps')
+    print('-' * 70)
+
     # most recent PPO stats (displayed in log lines between updates)
     last_stats: dict = {}
 
-    while global_steps < args.total_steps:
-        # ── LR annealing ──────────────────────────────────────────────────────
+    while global_steps < session_target_steps:
+        # ── LR annealing (per session, not lifetime env steps) ────────────────
         if args.anneal_lr:
-            frac = max(0.0, 1.0 - global_steps / args.total_steps)
+            session_progress = (global_steps - session_start_steps) / args.total_steps
+            frac = max(0.0, 1.0 - session_progress)
             agent.set_lr(args.lr * frac)
 
         # ── Collect one rollout ───────────────────────────────────────────────
@@ -417,7 +441,7 @@ def main():
                 ep_rewards[i] = 0.0
                 ep_steps[i]   = 0
 
-            bar.update(global_steps, sps=sps)
+            bar.update(global_steps - session_start_steps, sps=sps)
             obs = next_obs
 
         # ── PPO update ────────────────────────────────────────────────────────

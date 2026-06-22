@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from env.car_env import REWARD_VERSION
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Running statistics for observation normalisation
@@ -344,6 +346,7 @@ class PPOAgent:
             payload['global_episode'] = int(global_episode)
         if best_score is not None:
             payload['best_score'] = float(best_score)
+        payload['reward_version'] = REWARD_VERSION
         if best_eval_score is not None:
             payload['best_eval_score'] = float(best_eval_score)
         torch.save(payload, path)
@@ -404,6 +407,7 @@ class PPOAgent:
             self.resume_best_score = float(ckpt['best_eval_score'])
         else:
             self.resume_best_score = None
+        self.resume_reward_version = ckpt.get('reward_version')
 
     def load_weights(self, path: str):
         """Restore network/optimizer state from a checkpoint.
