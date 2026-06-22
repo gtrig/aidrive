@@ -65,7 +65,7 @@ def _shm_worker(
     lap_steps_arr  = arrays['lap_steps']   # (n_envs,)
     lap_bonus_arr  = arrays['lap_bonus']   # (n_envs,)  float32
 
-    REASON_CODES = {'off_road': 0, 'max_steps': 1, 'lap_complete': 2}
+    REASON_CODES = {'off_road': 0, 'timeout': 1, 'lap_complete': 2}
 
     # Initial reset
     obs, info = env.reset()
@@ -107,7 +107,7 @@ def _shm_worker(
 class ShmVecEnv:
     """Async shared-memory vectorised environment (drop-in for VecEnv)."""
 
-    REASON_NAMES = {0: 'off_road', 1: 'max_steps', 2: 'lap_complete'}
+    REASON_NAMES = {0: 'off_road', 1: 'timeout', 2: 'lap_complete'}
 
     def __init__(self, n_envs: int, **env_kwargs):
         self.n_envs = n_envs

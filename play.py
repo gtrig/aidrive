@@ -1,15 +1,15 @@
 """
 Visual play mode using the existing pyglet renderer.
 
-Without a policy:   human keyboard control (same as magame.py)
-With a policy:      the DQN agent drives; auto-resets and reloads the
+Without a policy:   human keyboard control
+With a policy:      the PPO agent drives; auto-resets and reloads the
                     newest checkpoint in models/ at the end of each episode.
 
 Usage:
     .venv/bin/python play.py                          # human control
-    .venv/bin/python play.py --policy models/dqn_best.pt
+    .venv/bin/python play.py --policy models/ppo_best.pt
     .venv/bin/python play.py --policy models/          # watch latest in dir
-    .venv/bin/python play.py --policy models/dqn_best.pt --allow-override
+    .venv/bin/python play.py --policy models/ppo_best.pt --allow-override
 """
 
 import argparse
@@ -52,10 +52,9 @@ def parse_args():
 # ------------------------------------------------------------------
 
 def latest_checkpoint(models_dir: str) -> Path | None:
-    """Return the most-recently-modified DQN .pt file in models_dir, or None.
-    PPO checkpoints (ppo_*.pt) are excluded since play.py uses a DQNAgent."""
+    """Return the most-recently-modified PPO .pt file in models_dir, or None."""
     pts = sorted(
-        (p for p in Path(models_dir).glob('*.pt') if not p.name.startswith('ppo_')),
+        (p for p in Path(models_dir).glob('*.pt') if p.name.startswith('ppo_')),
         key=lambda p: p.stat().st_mtime,
     )
     return pts[-1] if pts else None
@@ -138,10 +137,10 @@ def main():
             return
         if path == loaded_from:
             return      # already up to date
-        from agent.dqn import DQNAgent
+        from agent.ppo import PPOAgent
         obs_dim = _henv.obs_dim
         if agent is None:
-            agent = DQNAgent(obs_dim=obs_dim, n_actions=_henv.n_actions)
+            agent = PPOAgent(obs_dim=obs_dim, n_actions=_henv.n_actions)
         try:
             agent.load(str(path))
         except ValueError as e:
@@ -336,7 +335,7 @@ def main():
         # AI or human driving
         if agent and not keys_held:
             obs = build_obs(car, _henv, state['next_gate'])
-            accel, steer = ACTIONS[agent.act(obs, eval=True)]
+            accel, steer = ACTIONS[agent.evaluate(obs)]
             car.accelerate(accel)
             car.turn(steer)
 

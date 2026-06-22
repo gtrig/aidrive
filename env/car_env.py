@@ -32,20 +32,27 @@ ACTIONS = [
     (0.05, +12),    # 10 – throttle + sharp right
 ]
 
-# Reward weights
-R_GATE        =  5.0    # crossing the next gate forward
-R_LAP         = 10.0    # flat bonus for completing a full lap
-R_LAP_TIME    = 20.0    # additional time bonus: R_LAP_TIME * (1 - steps / LAP_REF_STEPS)
-LAP_REF_STEPS = 2000    # reference lap (slowest acceptable); faster → more bonus
-R_APPROACH    =  0.004  # per px closer to the next gate midpoint (dense signal)
-R_FORWARD     =  0.02   # per px of movement along the track-forward gate normal
-R_SPEED       =  0.008  # per unit of track-aligned forward speed
-R_WRONG_WAY   =  0.015  # per unit of speed when heading opposes track forward
-R_ON_ROAD     =  0.004  # per step while still on track (offsets time pressure)
-R_OFF_ROAD    = -5.0    # episode-ending penalty
-R_TIME        = -0.002  # mild per-step pressure (was -0.01 → -20/ep at timeout)
+# ── Reward weights ─────────────────────────────────────────────────────────
+# Kept deliberately simple so the agent cannot exploit reward interactions.
+# Signed progress toward the next gate provides the dense learning signal;
+# milestones add larger discrete bonuses.
+#
+# CRITICAL balance: R_OFF_ROAD must be >> R_TIME * MAX_STEPS so the agent
+# cannot learn a degenerate "stall on track indefinitely" policy that achieves
+# the same total reward as going off-road.  With R_OFF_ROAD=-20 and
+# R_TIME=-0.002, timeout gives -4 total vs -20 for instant off-road death.
+# Keeping R_OFF_ROAD low (-20 not -50) reduces return variance so the value
+# function does not dominate the policy gradient and entropy signal.
+R_PROGRESS      =  0.01    # per px closer to the next gate midpoint (signed)
+R_SPEED_ALIGN   =  0.005   # per unit of forward-aligned speed (breaks stalling)
+R_GATE          =  5.0     # discrete bonus for crossing the next gate
+R_GATE_SPEED    =  5.0     # max extra bonus for a fast gate-to-gate split
+GATE_REF_STEPS  = 30       # reference split length; faster segments earn more
+R_LAP           = 50.0     # flat bonus for completing a full lap
+R_OFF_ROAD      = -20.0    # terminal penalty for leaving the track
+R_TIME          = -0.002   # mild per-step cost (2000 * -0.002 = -4 total)
 
-MAX_STEPS     = 2000
+MAX_STEPS   = 2000
 
 # Normalisation constants
 SENSOR_MAX   = 200.0    # longest sensor size
@@ -142,6 +149,7 @@ class CarEnv:
         self._next_gate   = 0
         self._ep_gates    = 0   # gates crossed this episode
         self._lap_start_step = 0  # step when current lap began
+        self._gate_split_start_step = 0  # step when racing toward current gate began
         self._prev_pos    = (self._start_x, self._start_y)
         self._prev_dist   = 0.0
 
@@ -186,6 +194,7 @@ class CarEnv:
         self._next_gate      = gate_idx
         self._ep_gates       = 0
         self._lap_start_step = 0
+        self._gate_split_start_step = 0
         self._prev_pos  = (self.car.x, self.car.y)
         self._prev_dist = self._dist_to_next_gate(self.car.x, self.car.y)
 
@@ -202,70 +211,60 @@ class CarEnv:
         self.line_tools.getLinesInBox()
         self.line_tools.getIntesections()
 
-        reward = R_TIME + R_ON_ROAD
+        reward = R_TIME
         done   = False
         info   = {}
+
+        cur_pos  = (self.car.x, self.car.y)
 
         # off-road termination
         if not self._is_on_road(self.car.x, self.car.y):
             reward += R_OFF_ROAD
             done    = True
-            info['reason']     = 'off_road'
-            info['gates_hit']  = self._ep_gates
-            self._prev_pos = (self.car.x, self.car.y)
+            info['reason']    = 'off_road'
+            info['gates_hit'] = self._ep_gates
+            self._prev_pos = cur_pos
             return self._observation(), reward, done, info
 
+        # Forward-aligned speed bonus — breaks the degenerate "stall on track"
+        # policy by rewarding the car for actually moving toward the next gate.
+        # max() clips negative speed (reverse) to 0.
         alignment = self._track_alignment()
-        speed = max(self.car.speed, 0)
+        reward += R_SPEED_ALIGN * max(self.car.speed, 0.0) * max(alignment, 0.0)
 
-        # Speed reward only when heading aligns with track forward — raw speed
-        # rewarded the agent for throttling while facing backward.
-        reward += R_SPEED * speed * max(alignment, 0.0)
-        if alignment < 0.0 and speed > 0.0:
-            reward -= R_WRONG_WAY * speed
-
-        cur_pos  = (self.car.x, self.car.y)
+        # Dense signed-progress signal: positive when closing on next gate,
+        # negative when drifting away.  Implicitly discourages wrong-way driving.
         cur_dist = self._dist_to_next_gate(self.car.x, self.car.y)
-
-        # Forward progress along the track direction (gate normal).  Rewards
-        # driving the right way; penalises backing/sliding against track flow.
-        nx, ny = self._gate_normals[self._next_gate]
-        nlen = math.hypot(nx, ny) or 1.0
-        mvx = cur_pos[0] - self._prev_pos[0]
-        mvy = cur_pos[1] - self._prev_pos[1]
-        forward_progress = (mvx * nx + mvy * ny) / nlen
-        reward += R_FORWARD * forward_progress
-
-        # Dense approach reward only when advancing along the track — otherwise
-        # the agent can face backward, throttle "forward", and farm gate distance.
-        if forward_progress > 0:
-            reward += R_APPROACH * (self._prev_dist - cur_dist)
+        reward += R_PROGRESS * (self._prev_dist - cur_dist)
         self._prev_dist = cur_dist
 
-        # gate crossing (forward direction only)
-        # _next_gate wraps around so random-start episodes count a full loop
-        # back to the starting gate as a lap, not just to the last gate index.
+        # Gate crossing (forward direction only)
         gate   = self.gates[self._next_gate]
         normal = self._gate_normals[self._next_gate]
         if self._segment_crosses_gate(self._prev_pos, cur_pos, gate, normal):
-            reward += R_GATE
+            split_steps = max(1, self._step - self._gate_split_start_step)
+            speed_bonus = R_GATE_SPEED * max(
+                0.0, (GATE_REF_STEPS - split_steps) / GATE_REF_STEPS
+            )
+            reward += R_GATE + speed_bonus
             self._ep_gates  += 1
             self._next_gate  = (self._next_gate + 1) % self.n_gates
             self._prev_dist  = self._dist_to_next_gate(self.car.x, self.car.y)
+            self._gate_split_start_step = self._step
+            info['gate_split_steps'] = split_steps
+            info['gate_speed_bonus'] = speed_bonus
             if self._ep_gates >= self.n_gates:
-                lap_steps  = self._step - self._lap_start_step
-                time_bonus = R_LAP_TIME * max(0.0, 1.0 - lap_steps / LAP_REF_STEPS)
-                reward += R_LAP + time_bonus
+                reward += R_LAP
                 done    = True
-                info['reason']          = 'lap_complete'
-                info['gates_hit']       = self._ep_gates
-                info['lap_steps']       = lap_steps
-                info['lap_time_bonus']  = round(time_bonus, 3)
+                lap_steps = self._step - self._lap_start_step
+                info['reason']    = 'lap_complete'
+                info['gates_hit'] = self._ep_gates
+                info['lap_steps'] = lap_steps
 
         self._prev_pos = cur_pos
         self._step    += 1
 
-        if self._step >= self.max_steps:
+        if not done and self._step >= self.max_steps:
             done = True
             info['reason']    = 'timeout'
             info['gates_hit'] = self._ep_gates

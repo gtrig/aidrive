@@ -61,7 +61,9 @@ class LineTools():
         self.lines     = kwargs.get('lines', None)
         self.poi_x     = 0
         self.poi_y     = 0
-        self.poi_r     = kwargs.get('radius', 70)
+        # Radius must cover the longest sensor so that wall segments near the
+        # sensor tip are included.  200 matches TRAINING_SENSOR_LAYOUT max.
+        self.poi_r     = kwargs.get('radius', 220)
         self.poi_x_max = 0
         self.poi_x_min = 0
         self.poi_y_max = 0
@@ -112,10 +114,13 @@ class LineTools():
         return self._lines_sample_list
 
     def getLinesInBox(self):
-        """Return track lines inside the POI box as a numpy sub-array.
+        """Return track lines whose AABB overlaps the POI box as a numpy sub-array.
 
-        Uses a NumPy boolean mask over the pre-built lines array when available,
-        falling back to the original Python loop for correctness.
+        Uses segment-level AABB overlap so that wall segments near the sensor
+        tip (but whose far endpoint lies outside the box) are correctly included.
+        Previously this kept only segments where BOTH endpoints were inside the
+        box, which caused sensors longer than poi_r to return max-distance even
+        when a wall was just beyond the box edge.
         """
         if self._lines_arr is None or len(self._lines_arr) == 0:
             self._lines_sample_arr = np.zeros((0, 2, 2), dtype=np.float32)
@@ -126,19 +131,22 @@ class LineTools():
         xmin, xmax = self.poi_x_min, self.poi_x_max
         ymin, ymax = self.poi_y_min, self.poi_y_max
 
-        # Keep lines where BOTH endpoints are inside the box.
-        # shape of arr[:,0,0] etc. is (N,).
         x0, y0 = arr[:, 0, 0], arr[:, 0, 1]
         x1, y1 = arr[:, 1, 0], arr[:, 1, 1]
 
-        inside = (
-            (x0 >= xmin) & (x0 <= xmax) &
-            (y0 >= ymin) & (y0 <= ymax) &
-            (x1 >= xmin) & (x1 <= xmax) &
-            (y1 >= ymin) & (y1 <= ymax)
+        # Segment AABB overlaps the query box when the segment's bounding
+        # interval overlaps on both axes (separating-axis test).
+        seg_xmin = np.minimum(x0, x1)
+        seg_xmax = np.maximum(x0, x1)
+        seg_ymin = np.minimum(y0, y1)
+        seg_ymax = np.maximum(y0, y1)
+
+        overlaps = (
+            (seg_xmax >= xmin) & (seg_xmin <= xmax) &
+            (seg_ymax >= ymin) & (seg_ymin <= ymax)
         )
 
-        self._lines_sample_arr = arr[inside]          # (M, 2, 2)
+        self._lines_sample_arr = arr[overlaps]        # (M, 2, 2)
         self._lines_sample_list = None                # invalidate lazy list
         return self._lines_sample_arr
 
